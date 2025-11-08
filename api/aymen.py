@@ -2,40 +2,122 @@ import os
 import logging
 import requests
 import json
+import threading
 from flask import Flask, request, jsonify
+from datetime import datetime, timedelta, timezone
+from dateutil import parser 
 
-# تهيئة التسجيل (Logging)
-# هذا يساعد في تتبع الطلبات والأخطاء على Vercel
+# --- تهيئة التسجيل (Logging) ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- إعدادات البوت والـ API (يرجى التعديل) ---
-# رمز التوثيق للـ Webhook الذي يتم إدخاله في إعدادات فيسبوك (كما طلب المستخدم)
+# --- إعدادات البوت والـ API (يتم جلبها من البيئة أو استخدام قيم افتراضية) ---
+# رمز التوثيق للـ Webhook (كما طلب المستخدم)
 VERIFY_TOKEN = 'boykta 2023'
 
-# رمز الوصول الخاص بالصفحة. يجب تعيينه كمتغير بيئة سري على Vercel
-# (مثال: PAGE_ACCESS_TOKEN). قم بوضع قيمة وهمية هنا لتذكيرك بالتغيير.
-PAGE_ACCESS_TOKEN = os.environ.get('PAGE_ACCESS_TOKEN', 'ضع_رمز_الوصول_الخاص_بصفحتك_هنا')
+# يجب تعيين هذا كمتغير بيئة سري على Vercel
+PAGE_ACCESS_TOKEN = os.environ.get('PAGE_ACCESS_TOKEN', 'رمز_وصول_صفحة_فيسبوك_الخاص_بك')
 
-# رابط الـ API الخارجي الذي سيتم استدعاؤه
-API_URL = "https://sonnet3-5.free.nf/api/reasoning.php"
+# يجب تعيين هذا كمتغير بيئة سري على Vercel
+DEVICE_ID = os.environ.get('DEVICE_ID', 'B4A13AE09F22A2A4') 
+
+# عناوين الـ API
+AUTH_API_URL = "https://api.vulcanlabs.co/smith-auth/api/v1/token"
+CHAT_API_URL = "https://api.vulcanlabs.co/smith-v2/api/v7/chat_android"
+
+# إعدادات المحادثة
+MAX_CHAT_HISTORY = 100 
+MAX_TOKENS = 0 # 0 تعني استخدام الإعداد الافتراضي للنموذج
+
+# --- المتغيرات العامة لحفظ الحالة ---
+user_chats = {}  # لتخزين سجل الدردشة لكل مستخدم
+access_token_data = {"token": "", "expiry": datetime.now(timezone.utc)} # لتخزين توكن الوصول ووقته
 
 # تهيئة تطبيق Flask
 app = Flask(__name__)
 
-# --- 1. وظيفة إرسال الرسائل إلى ماسنجر ---
-def send_message(recipient_id, message_text, quick_replies=None):
-    """
-    إرسال رسالة إلى المستخدم باستخدام Messenger Send API.
-    يمكن أن تتضمن الردود السريعة (Quick Replies) كأزرار.
-    """
-    logger.info(f"إرسال رسالة إلى: {recipient_id}")
+# --- 1. وظيفة جلب التوكن (Vulcan Labs Auth) ---
+def get_access_token(force_refresh=False):
+    """جلب أو تجديد توكن الوصول من Vulcan Labs API."""
+    global access_token_data
+    
+    # التحقق من صلاحية التوكن الحالي
+    if not force_refresh and access_token_data["token"] and access_token_data["expiry"] > datetime.now(timezone.utc):
+        return access_token_data["token"]
 
+    logger.info("جلب/تجديد توكن الوصول من Vulcan Labs.")
+    url = AUTH_API_URL
+    payload = {"device_id": DEVICE_ID, "order_id": "", "product_id": "", "purchase_token": "", "subscription_id": ""}
+    headers = {
+        "User-Agent": "Chat Smith Android, Version 4.0.5(1032)",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "x-vulcan-application-id": "com.smartwidgetlabs.chatgpt",
+        "x-vulcan-request-id": "9149487891757687027212"
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response.raise_for_status() # إطلاق استثناء إذا كانت الحالة HTTP غير ناجحة (4xx أو 5xx)
+        data = response.json()
+        
+        token = data.get("AccessToken", "")
+        expiry_str = data.get("AccessTokenExpiration")
+        
+        if expiry_str:
+            expiry = parser.isoparse(expiry_str).astimezone(timezone.utc)
+        else:
+            # تعيين وقت انتهاء صلاحية افتراضي في حال عدم توفره
+            expiry = datetime.now(timezone.utc) + timedelta(minutes=30)
+            
+        access_token_data = {"token": token, "expiry": expiry}
+        return token
+    except Exception as e:
+        logger.error(f"فشل الحصول على التوكن: {e}")
+        return ""
+
+# --- 2. وظيفة الاستعلام من Vulcan Labs API ---
+def query_vulcan(token, messages):
+    """إرسال سجل الدردشة إلى Vulcan Labs Chat API والحصول على الرد."""
+    url = CHAT_API_URL
+    payload = {
+        "model": "gpt-4o-mini",
+        "user": DEVICE_ID,
+        "messages": messages,
+        "max_tokens": MAX_TOKENS,
+        "nsfw_check": True
+    }
+    headers = {
+        "User-Agent": "Chat Smith Android, Version 4.0.5(1032)",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "x-auth-token": token,
+        "authorization": f"Bearer {token}",
+        "x-vulcan-application-id": "com.smartwidgetlabs.chatgpt",
+        "x-vulcan-request-id": "9149487891757687028153"
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        
+        # استخراج المحتوى المتوقع
+        if data.get("choices") and data["choices"][0].get("Message") and data["choices"][0]["Message"].get("content"):
+            return data["choices"][0]["Message"]["content"]
+        else:
+            logger.error(f"رد غير متوقع من Vulcan: {data}")
+            return "حدث خطأ أثناء معالجة الرد من النموذج."
+    except Exception as e:
+        logger.error(f"خطأ في طلب Vulcan: {e}")
+        return "حدث خطأ أثناء الاتصال بالنموذج."
+
+# --- 3. وظيفة إرسال الرسائل إلى ماسنجر ---
+def send_message(recipient_id, message_text, quick_replies=None):
+    """إرسال رسالة إلى المستخدم، تدعم الردود السريعة."""
+    
     # بناء حمولة الرسالة
     message_payload = {"text": message_text}
     
     if quick_replies:
-        # إذا تم توفير أزرار الردود السريعة
         message_payload["quick_replies"] = quick_replies
 
     data = {
@@ -57,59 +139,59 @@ def send_message(recipient_id, message_text, quick_replies=None):
         )
         if response.status_code != 200:
             logger.error(f"فشل إرسال الرسالة: {response.status_code} - {response.text}")
-            # يمكن إرسال رسالة خطأ داخلية للمستخدم هنا إذا لزم الأمر
         else:
-            logger.info("تم إرسال الرسالة بنجاح.")
+            logger.info(f"تم إرسال الرسالة بنجاح إلى: {recipient_id}")
             
     except requests.exceptions.RequestException as e:
         logger.error(f"خطأ في طلب الـ API لـ Messenger: {e}")
 
-# --- 2. وظيفة معالجة النص واستدعاء الـ API الخارجي ---
-def call_api_and_respond(recipient_id, user_text):
+# --- 4. وظيفة معالجة الرسالة الرئيسية (تنفذ في خيط منفصل) ---
+def process_message_thread(sender_id, user_text):
     """
-    تستدعي الـ API الخارجي وتعالج الرد، ثم ترسل النتيجة للمستخدم.
+    تنفذ منطق استدعاء الـ API والرد. 
+    يتم تشغيلها في خيط منفصل لتجنب انتهاء مهلة الويب هوك.
     """
     
     # رسالة للمستخدم أثناء المعالجة
-    send_message(recipient_id, "جارٍ معالجة النص، لحظة من فضلك...")
+    send_message(sender_id, "جارٍ معالجة طلبك، لحظة من فضلك...")
 
-    try:
-        # إعداد بيانات الطلب
-        payload = {'text': user_text}
-        
-        # إرسال طلب GET إلى الـ API الخارجي
-        response = requests.get(API_URL, params=payload, timeout=30)
-        
-        if response.status_code == 200:
-            api_result = response.text
-            
-            # إعداد أزرار الرد السريع كأمثلة (يمكنك تغييرها)
-            quick_replies = [
-                {"content_type": "text", "title": "مزيد من التفاصيل", "payload": "PAYLOAD_DETAILS"},
-                {"content_type": "text", "title": "سؤال جديد", "payload": "PAYLOAD_NEW_QUESTION"}
-            ]
-            
-            # الرد على المستخدم بنتيجة الـ API مع الأزرار
-            final_message = f"**نتيجة المعالجة:**\n\n{api_result}"
-            send_message(recipient_id, final_message, quick_replies)
-            
-        else:
-            send_message(recipient_id, f"حدث خطأ في الاتصال بالـ API. رمز الحالة: {response.status_code}")
+    token = get_access_token()
+    if not token:
+        send_message(sender_id, "فشل الحصول على رمز التوكن اللازم للوصول إلى النموذج. يرجى المحاولة مرة أخرى.")
+        return
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"خطأ في طلب الـ API الخارجي: {e}")
-        send_message(recipient_id, "عذراً، حدث خطأ أثناء محاولة الاتصال بخدمة المعالجة.")
-    except Exception as e:
-        logger.error(f"خطأ غير متوقع: {e}")
-        send_message(recipient_id, "حدث خطأ غير متوقع. يرجى المحاولة مرة أخرى لاحقاً.")
+    # إعداد سجل الدردشة
+    if sender_id not in user_chats:
+        user_chats[sender_id] = []
 
-# --- 3. نقطة نهاية الويب هوك (GET) للتحقق ---
+    # إضافة رسالة المستخدم
+    user_chats[sender_id].append({"role": "user", "content": user_text})
+
+    # تقليم سجل الدردشة للحفاظ على الحجم (2 * MAX_CHAT_HISTORY بسبب دور 'user' و 'assistant')
+    if len(user_chats[sender_id]) > MAX_CHAT_HISTORY * 2:
+        user_chats[sender_id] = user_chats[sender_id][-MAX_CHAT_HISTORY*2:]
+
+    # استدعاء Vulcan API
+    reply = query_vulcan(token, user_chats[sender_id])
+
+    # إضافة رد المساعد إلى سجل الدردشة
+    user_chats[sender_id].append({"role": "assistant", "content": reply})
+
+    # إعداد أزرار الرد السريع (Quick Replies)
+    quick_replies = [
+        {"content_type": "text", "title": "سؤال جديد", "payload": "NEW_QUESTION"},
+        {"content_type": "text", "title": "مسح السجل", "payload": "CLEAR_HISTORY"},
+        {"content_type": "text", "title": "المساعدة", "payload": "HELP"}
+    ]
+    
+    # الرد على المستخدم بنتيجة الـ API مع الأزرار
+    send_message(sender_id, reply, quick_replies)
+
+
+# --- 5. نقطة نهاية الويب هوك (GET) للتحقق ---
 @app.route("/", methods=["GET"])
 def verify_webhook():
-    """
-    نقطة نهاية للتحقق من الويب هوك لفيسبوك.
-    تستخدم رمز VERIFY_TOKEN ('boykta 2023')
-    """
+    """التحقق من الويب هوك باستخدام رمز التوثيق boykta 2023."""
     try:
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
@@ -122,52 +204,55 @@ def verify_webhook():
             else:
                 return "Verification token mismatch", 403
         
-        return "Webhook setup endpoint. Pass correct parameters for verification.", 200
+        return "Webhook setup endpoint.", 200
 
     except Exception as e:
         logger.error(f"خطأ أثناء التحقق من الويب هوك: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-# --- 4. نقطة نهاية الويب هوك (POST) لاستقبال الرسائل ---
+# --- 6. نقطة نهاية الويب هوك (POST) لاستقبال الرسائل ---
 @app.route("/", methods=["POST"])
 def webhook():
-    """
-    نقطة نهاية لاستقبال رسائل المستخدمين من فيسبوك.
-    """
+    """استقبال رسائل المستخدمين ومعالجتها."""
     try:
         data = request.json
-        logger.info(f"استلام بيانات الويب هوك: {data}")
+        logger.info(f"استلام بيانات الويب هوك.")
 
         if data.get("object") == "page":
             for entry in data["entry"]:
                 for messaging_event in entry.get("messaging", []):
                     sender_id = messaging_event["sender"]["id"]
                     
-                    # تحقق مما إذا كانت رسالة نصية
                     if messaging_event.get("message"):
-                        # تجاهل رسائل الإيموجي أو المرفقات، وركز على النص
-                        if 'text' in messaging_event['message']:
+                        
+                        # معالجة ضغطة زر الرد السريع (Quick Reply)
+                        if 'quick_reply' in messaging_event['message']:
+                            payload = messaging_event['message']['quick_reply']['payload']
+                            
+                            if payload == "CLEAR_HISTORY":
+                                user_chats[sender_id] = []
+                                send_message(sender_id, "تم مسح سجل محادثتك بالكامل. يمكنك البدء بسؤال جديد الآن!")
+                            elif payload == "HELP":
+                                send_message(sender_id, "أنا بوت يعمل بالذكاء الاصطناعي ويستخدم نموذج GPT-4o-mini لمعالجة النصوص. أرسل لي أي سؤال أو كود!")
+                            elif payload == "NEW_QUESTION":
+                                send_message(sender_id, "تفضل، ما هو سؤالك الجديد؟")
+                            else:
+                                send_message(sender_id, f"تلقيت الأمر: {payload}. تفضل بطرح سؤالك.")
+                        
+                        # معالجة الرسالة النصية
+                        elif 'text' in messaging_event['message']:
                             message_text = messaging_event["message"]["text"]
-                            call_api_and_respond(sender_id, message_text)
+                            
+                            # تشغيل المعالجة في خيط منفصل لتجنب انتهاء مهلة الويب هوك (10 ثوانٍ)
+                            threading.Thread(target=process_message_thread, args=(sender_id, message_text)).start()
+                            
                         else:
-                            # للرد على أي مرفقات أو إيموجي برسالة بسيطة
+                            # الرد على أنواع الرسائل الأخرى (ملصقات، صور، إلخ)
                             send_message(sender_id, "عذراً، أنا أستطيع معالجة الرسائل النصية فقط.")
                             
-                    # يمكنك إضافة معالجة لـ Quick Reply هنا إذا كان الرد هو ضغطة زر
+                    # معالجة رسالة "بدء الاستخدام" (Postback) - اختيارية، لكن تركناها للتعامل مع أي حالة قديمة
                     elif messaging_event.get("postback"):
-                        # مثال على معالجة زر "ابدأ" إذا لم يتم إلغاؤه
-                        payload = messaging_event["postback"]["payload"]
-                        send_message(sender_id, f"تلقيت الأمر: {payload}")
-                        
-                    # معالجة الردود السريعة (Quick Replies)
-                    elif messaging_event.get("quick_reply"):
-                        payload = messaging_event["quick_reply"]["payload"]
-                        if payload == "PAYLOAD_DETAILS":
-                             send_message(sender_id, "سأبحث عن مزيد من التفاصيل لك...")
-                        elif payload == "PAYLOAD_NEW_QUESTION":
-                            send_message(sender_id, "تفضل بطرح سؤالك الجديد!")
-                        else:
-                             send_message(sender_id, f"تلقيت استجابة الرد السريع: {payload}")
+                         send_message(sender_id, "أهلاً بك! يمكنك البدء بإرسال سؤالك مباشرةً.")
 
 
             return "OK", 200
@@ -178,8 +263,7 @@ def webhook():
         logger.error(f"خطأ في معالجة رسالة الويب هوك: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-# تشغيل التطبيق محلياً (لن يتم تشغيله على Vercel لأن Vercel يدير التشغيل)
+# تشغيل التطبيق محلياً (لن يتم تنفيذه على Vercel)
 if __name__ == "__main__":
-    # تشغيل التطبيق على منفذ محلي للاختبار
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
