@@ -1,170 +1,185 @@
 import os
-import json
 import logging
 import requests
+import json
 from flask import Flask, request, jsonify
 
-# =========================================================
-# === إعدادات البوت والـ API (يجب تغيير هذه القيم) ===
-# =========================================================
-
-# رمز التوكن الخاص بصفحة فيسبوك (Page Access Token)
-# يجب الحصول عليه من تطبيق فيسبوك الخاص بك
-PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "YOUR_FACEBOOK_PAGE_ACCESS_TOKEN_HERE")
-
-# رمز التحقق من الويب هوك الذي وضعته في إعدادات فيسبوك
-VERIFY_TOKEN = "boykta 2023"
-
-# عنوان API الخارجي لمعالجة النصوص
-API_URL = "https://sonnet3-5.free.nf/api/reasoning.php"
-
-# =========================================================
-# === تهيئة Flask والتسجيل (Logging) ===
-# =========================================================
-
-app = Flask(__name__)
+# تهيئة التسجيل (Logging)
+# هذا يساعد في تتبع الطلبات والأخطاء على Vercel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# =========================================================
-# === دالة إرسال الرسائل إلى فيسبوك Messenger ===
-# =========================================================
+# --- إعدادات البوت والـ API (يرجى التعديل) ---
+# رمز التوثيق للـ Webhook الذي يتم إدخاله في إعدادات فيسبوك (كما طلب المستخدم)
+VERIFY_TOKEN = 'boykta 2023'
 
-def send_facebook_message(recipient_id, message_text, quick_replies=None):
+# رمز الوصول الخاص بالصفحة. يجب تعيينه كمتغير بيئة سري على Vercel
+# (مثال: PAGE_ACCESS_TOKEN). قم بوضع قيمة وهمية هنا لتذكيرك بالتغيير.
+PAGE_ACCESS_TOKEN = os.environ.get('PAGE_ACCESS_TOKEN', 'ضع_رمز_الوصول_الخاص_بصفحتك_هنا')
+
+# رابط الـ API الخارجي الذي سيتم استدعاؤه
+API_URL = "https://sonnet3-5.free.nf/api/reasoning.php"
+
+# تهيئة تطبيق Flask
+app = Flask(__name__)
+
+# --- 1. وظيفة إرسال الرسائل إلى ماسنجر ---
+def send_message(recipient_id, message_text, quick_replies=None):
     """
-    إرسال رسالة إلى فيسبوك Messenger باستخدام Page Access Token.
-    يمكن إضافة Quick Replies (أزرار) اختيارياً.
+    إرسال رسالة إلى المستخدم باستخدام Messenger Send API.
+    يمكن أن تتضمن الردود السريعة (Quick Replies) كأزرار.
     """
+    logger.info(f"إرسال رسالة إلى: {recipient_id}")
+
+    # بناء حمولة الرسالة
+    message_payload = {"text": message_text}
+    
+    if quick_replies:
+        # إذا تم توفير أزرار الردود السريعة
+        message_payload["quick_replies"] = quick_replies
+
+    data = {
+        "recipient": {"id": recipient_id},
+        "message": message_payload,
+        "messaging_type": "RESPONSE"
+    }
+    
+    # إرسال طلب POST إلى Messenger API
     params = {"access_token": PAGE_ACCESS_TOKEN}
     headers = {"Content-Type": "application/json"}
     
-    # بناء حمولة (Payload) الرسالة
-    data = {
-        'recipient': {'id': recipient_id},
-        'message': {'text': message_text}
-    }
-
-    # إضافة الأزرار (Quick Replies) إذا كانت موجودة
-    if quick_replies:
-        data['message']['quick_replies'] = quick_replies
-
     try:
         response = requests.post(
-            f"https://graph.facebook.com/v19.0/me/messages",
+            "https://graph.facebook.com/v19.0/me/messages",
             params=params,
             headers=headers,
             data=json.dumps(data)
         )
-        response.raise_for_status() # إلقاء استثناء لأكواد الحالة الخاطئة (4xx أو 5xx)
-        logger.info(f"تم إرسال الرسالة بنجاح إلى {recipient_id}")
+        if response.status_code != 200:
+            logger.error(f"فشل إرسال الرسالة: {response.status_code} - {response.text}")
+            # يمكن إرسال رسالة خطأ داخلية للمستخدم هنا إذا لزم الأمر
+        else:
+            logger.info("تم إرسال الرسالة بنجاح.")
+            
     except requests.exceptions.RequestException as e:
-        logger.error(f"فشل إرسال الرسالة إلى فيسبوك: {e}")
-        logger.error(f"رد فيسبوك: {response.text}")
+        logger.error(f"خطأ في طلب الـ API لـ Messenger: {e}")
 
-# =========================================================
-# === دالة معالجة النصوص واستدعاء API الخارجي ===
-# =========================================================
-
-def process_and_reply(sender_id, user_text):
+# --- 2. وظيفة معالجة النص واستدعاء الـ API الخارجي ---
+def call_api_and_respond(recipient_id, user_text):
     """
-    استدعاء API الخارجي وإرسال النتيجة مرة أخرى للمستخدم.
+    تستدعي الـ API الخارجي وتعالج الرد، ثم ترسل النتيجة للمستخدم.
     """
-    logger.info(f"معالجة النص من {sender_id}: {user_text}")
-
-    # إرسال رسالة انتظار للمستخدم
-    send_facebook_message(sender_id, "جارٍ معالجة طلبك باستخدام الـ API الخارجي، لحظة من فضلك...")
+    
+    # رسالة للمستخدم أثناء المعالجة
+    send_message(recipient_id, "جارٍ معالجة النص، لحظة من فضلك...")
 
     try:
-        # إعداد بيانات الطلب (باستخدام المعامل 'text')
+        # إعداد بيانات الطلب
         payload = {'text': user_text}
         
         # إرسال طلب GET إلى الـ API الخارجي
         response = requests.get(API_URL, params=payload, timeout=30)
-        response.raise_for_status() # التأكد من حالة 200
-
-        # افتراض أن الرد هو نص عادي أو بيانات يمكن طباعتها مباشرة
-        api_result = response.text
         
-        # تحديد الأزرار (Quick Replies) المراد إرسالها مع الرد
-        # يمكنك تخصيص هذه الأزرار حسب وظيفة البوت
-        buttons = [
-            {"content_type": "text", "title": "معالجة جديدة", "payload": "NEW_PROCESS"},
-            {"content_type": "text", "title": "مساعدة", "payload": "HELP"},
-        ]
-        
-        # الرد على المستخدم بنتيجة الـ API مع الأزرار
-        send_facebook_message(
-            sender_id, 
-            f"**نتيجة المعالجة:**\n\n{api_result}",
-            quick_replies=buttons
-        )
+        if response.status_code == 200:
+            api_result = response.text
+            
+            # إعداد أزرار الرد السريع كأمثلة (يمكنك تغييرها)
+            quick_replies = [
+                {"content_type": "text", "title": "مزيد من التفاصيل", "payload": "PAYLOAD_DETAILS"},
+                {"content_type": "text", "title": "سؤال جديد", "payload": "PAYLOAD_NEW_QUESTION"}
+            ]
+            
+            # الرد على المستخدم بنتيجة الـ API مع الأزرار
+            final_message = f"**نتيجة المعالجة:**\n\n{api_result}"
+            send_message(recipient_id, final_message, quick_replies)
+            
+        else:
+            send_message(recipient_id, f"حدث خطأ في الاتصال بالـ API. رمز الحالة: {response.status_code}")
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"خطأ في الاتصال بالـ API الخارجي: {e}")
-        send_facebook_message(
-            sender_id, 
-            "عذراً، حدث خطأ أثناء محاولة الاتصال بخدمة المعالجة الخارجية."
-        )
+        logger.error(f"خطأ في طلب الـ API الخارجي: {e}")
+        send_message(recipient_id, "عذراً، حدث خطأ أثناء محاولة الاتصال بخدمة المعالجة.")
     except Exception as e:
         logger.error(f"خطأ غير متوقع: {e}")
-        send_facebook_message(
-            sender_id, 
-            "حدث خطأ غير متوقع. يرجى المحاولة لاحقاً."
-        )
+        send_message(recipient_id, "حدث خطأ غير متوقع. يرجى المحاولة مرة أخرى لاحقاً.")
 
-
-# =========================================================
-# === مسار الـ Webhook لتأكيد فيسبوك واستقبال الرسائل ===
-# =========================================================
-
-@app.route('/webhook', methods=['GET', 'POST'])
-def webhook():
+# --- 3. نقطة نهاية الويب هوك (GET) للتحقق ---
+@app.route("/", methods=["GET"])
+def verify_webhook():
     """
-    نقطة النهاية الرئيسية لمعالجة طلبات الويب هوك من فيسبوك.
+    نقطة نهاية للتحقق من الويب هوك لفيسبوك.
+    تستخدم رمز VERIFY_TOKEN ('boykta 2023')
     """
-    if request.method == 'GET':
-        # --- معالجة طلب التحقق (Verification) ---
-        mode = request.args.get('hub.mode')
-        token = request.args.get('hub.verify_token')
-        challenge = request.args.get('hub.challenge')
+    try:
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
 
         if mode and token:
-            if mode == 'subscribe' and token == VERIFY_TOKEN:
+            if mode == "subscribe" and token == VERIFY_TOKEN:
                 logger.info("تم التحقق من الويب هوك بنجاح!")
                 return challenge, 200
             else:
-                return "رمز التحقق غير صحيح", 403
+                return "Verification token mismatch", 403
         
-        # إذا لم يكن طلب تحقُّق، نرجع خطأ 400
-        return "طلب غير صحيح", 400
+        return "Webhook setup endpoint. Pass correct parameters for verification.", 200
 
-    elif request.method == 'POST':
-        # --- معالجة الرسائل الواردة (Message Handling) ---
-        data = request.get_json()
-        logger.info(f"البيانات الواردة: {data}")
+    except Exception as e:
+        logger.error(f"خطأ أثناء التحقق من الويب هوك: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# --- 4. نقطة نهاية الويب هوك (POST) لاستقبال الرسائل ---
+@app.route("/", methods=["POST"])
+def webhook():
+    """
+    نقطة نهاية لاستقبال رسائل المستخدمين من فيسبوك.
+    """
+    try:
+        data = request.json
+        logger.info(f"استلام بيانات الويب هوك: {data}")
 
         if data.get("object") == "page":
             for entry in data["entry"]:
-                for event in entry["messaging"]:
-                    sender_id = event["sender"]["id"]
+                for messaging_event in entry.get("messaging", []):
+                    sender_id = messaging_event["sender"]["id"]
                     
-                    # 1. معالجة الرسائل النصية
-                    if "message" in event and "text" in event["message"]:
-                        user_text = event["message"]["text"]
-                        process_and_reply(sender_id, user_text)
-                    
-                    # 2. معالجة النقرات على الأزرار (Quick Replies أو Postbacks)
-                    elif "postback" in event:
-                        # يمكنك إضافة منطق خاص لمعالجة الـ Postbacks هنا إذا استخدمت أزرار القوالب
-                        postback_payload = event["postback"]["payload"]
-                        send_facebook_message(sender_id, f"تلقيت الأمر: {postback_payload}")
+                    # تحقق مما إذا كانت رسالة نصية
+                    if messaging_event.get("message"):
+                        # تجاهل رسائل الإيموجي أو المرفقات، وركز على النص
+                        if 'text' in messaging_event['message']:
+                            message_text = messaging_event["message"]["text"]
+                            call_api_and_respond(sender_id, message_text)
+                        else:
+                            # للرد على أي مرفقات أو إيموجي برسالة بسيطة
+                            send_message(sender_id, "عذراً، أنا أستطيع معالجة الرسائل النصية فقط.")
+                            
+                    # يمكنك إضافة معالجة لـ Quick Reply هنا إذا كان الرد هو ضغطة زر
+                    elif messaging_event.get("postback"):
+                        # مثال على معالجة زر "ابدأ" إذا لم يتم إلغاؤه
+                        payload = messaging_event["postback"]["payload"]
+                        send_message(sender_id, f"تلقيت الأمر: {payload}")
+                        
+                    # معالجة الردود السريعة (Quick Replies)
+                    elif messaging_event.get("quick_reply"):
+                        payload = messaging_event["quick_reply"]["payload"]
+                        if payload == "PAYLOAD_DETAILS":
+                             send_message(sender_id, "سأبحث عن مزيد من التفاصيل لك...")
+                        elif payload == "PAYLOAD_NEW_QUESTION":
+                            send_message(sender_id, "تفضل بطرح سؤالك الجديد!")
+                        else:
+                             send_message(sender_id, f"تلقيت استجابة الرد السريع: {payload}")
 
-        return "EVENT_RECEIVED", 200
 
-# =========================================================
-# === تشغيل التطبيق (للنشر على Vercel، هذا القسم اختياري) ===
-# =========================================================
+            return "OK", 200
+        else:
+            return "Event not from a page", 403
+            
+    except Exception as e:
+        logger.error(f"خطأ في معالجة رسالة الويب هوك: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
-# ملاحظة: Vercel يستخدم بروتوكول WSGI تلقائياً، لذا هذا الجزء هو للاختبار المحلي
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
+# تشغيل التطبيق محلياً (لن يتم تشغيله على Vercel لأن Vercel يدير التشغيل)
+if __name__ == "__main__":
+    # تشغيل التطبيق على منفذ محلي للاختبار
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
