@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/aymen.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/webhook",
+      "dest": "api/aymen.py"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "api/aymen.py"
+    }
+  ]
+}
