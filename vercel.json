@@ -1,19 +1,9 @@
 {
   "version": 2,
-  "builds": [
+  "rewrites": [
     {
-      "src": "api/aymen.py",
-      "use": "@vercel/python"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/webhook",
-      "dest": "api/aymen.py"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "api/aymen.py"
+      "source": "/(.*)",
+      "destination": "http://noel.hidencloud.com:24674/$1"
     }
   ]
 }
